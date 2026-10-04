@@ -1,0 +1,36 @@
+# Secrets and credentials - never commit these
+.env
+.env.*
+*.env
+dhan_token.json
+*_token.json
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.Python
+venv/
+.venv/
+env/
+ENV/
+
+# Packaging / tooling
+build/
+dist/
+*.egg-info/
+.venv
+
+# Logs
+*.log
+logs/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
