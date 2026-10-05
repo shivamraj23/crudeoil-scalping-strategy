@@ -2,8 +2,10 @@
 .env
 .env.*
 *.env
+.streamlit/secrets.toml
 dhan_token.json
 *_token.json
+alert_state.json
 *.pem
 *.key
 
