@@ -1,0 +1,18 @@
+[Unit]
+Description=Crude Oil Mini 1-min ADX alert bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=crudeoil
+Group=crudeoil
+WorkingDirectory=/opt/crudeoil_scalping_strategy
+ExecStart=/opt/crudeoil_scalping_strategy/.venv/bin/python /opt/crudeoil_scalping_strategy/crudeoil_onemin_alerts.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+SyslogIdentifier=crudeoil-alerts
+
+[Install]
+WantedBy=multi-user.target
