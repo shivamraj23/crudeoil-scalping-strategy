@@ -3,5 +3,3 @@ numpy
 requests
 pyotp
 python-dotenv
-streamlit>=1.33
-plotly>=5.9
