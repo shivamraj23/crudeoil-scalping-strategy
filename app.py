@@ -1,38 +1,35 @@
 """
-Streamlit UI for the Supertrend option-selling bot.
+Streamlit UI for the F&O stock Supertrend intraday scanner.
 
-The bot itself (supertrend_optionselling_10mintf.py) is NOT modified - it is imported
-as a module, so this app re-uses exactly the same Dhan login, 1m -> 10m candle build,
-Supertrend/ADX maths, strike picking and Discord alert code.
+The scanner (supertrend_fno_alerts.py) is imported untouched, so this app re-uses
+exactly the same Dhan login, F&O universe download, 1m -> 10m candle build,
+Supertrend + ADX/DMI maths and Discord alerts.
 
 What the UI adds:
-  * a Start / Stop monitor button - checks every 20s and alerts on each 10-minute
-    candle close, for as long as the browser tab stays open
-  * a "Run check once" button
-  * live price / trend / ADX metrics, Supertrend + ADX chart, candle table
-  * "Send day summary" and "Test Discord" buttons
+  * a "Scan and alert" button - downloads the F&O universe, walks every stock and
+    sends a Discord alert for each qualifying flip
+  * a "Scan only" button - same scan without touching Discord
+  * a results table (ADX, ADX min/max of the last 15 candles, +DI/-DI, DMI gap)
+  * "Test Discord" and "Clear results" buttons
+  * a live progress bar / per-stock status and an error counter
 
 Local:  streamlit run app.py          (credentials read from .env)
 Cloud:  main file = app.py, credentials go in Settings > Secrets
         (see .streamlit/secrets.toml.example)
 """
 import inspect
-import json
 import os
 import sys
-import tempfile
+import time
 from pathlib import Path
 
 import pandas as pd
-import plotly.graph_objects as go
+import requests
 import streamlit as st
-from plotly.subplots import make_subplots
 
 HERE = Path(__file__).resolve().parent
-BOT_SCRIPT = "supertrend_optionselling_10mintf"
+BOT_SCRIPT = "supertrend_fno_alerts"
 
-TMP_DIR = Path(tempfile.gettempdir()) / "supertrend_streamlit"
-STATS_FILE = TMP_DIR / "stats.json"
 
 # newer Streamlit renamed use_container_width -> width; pick whatever this version takes
 def _wide(fn):
@@ -42,19 +39,19 @@ def _wide(fn):
 
 WIDE_BUTTON = _wide(st.button)
 WIDE_FRAME = _wide(st.dataframe)
-WIDE_CHART = _wide(st.plotly_chart)
+WIDE_DOWNLOAD = _wide(st.download_button)
 
 SECRET_KEYS = {
     "DHAN_CLIENT_ID": ("dhan", "client_id"),
+    "DHAN_ACCESS_TOKEN": ("dhan", "access_token"),
     "DHAN_PIN": ("dhan", "pin"),
     "DHAN_TOTP_SECRET": ("dhan", "totp_secret"),
-    "DHAN_ACCESS_TOKEN": ("dhan", "access_token"),
-    "DISCORD_WEBHOOK_URL": ("discord", "webhook_url"),
+    "DISCORD_WEBHOOK_SUPERTREND_FNO_STOCKS": ("discord", "supertrend_fno_stocks"),
 }
 
 
 # =========================================================
-# BOOTSTRAP: secrets -> env -> import the untouched bot
+# BOOTSTRAP: secrets -> env -> import the untouched scanner
 # =========================================================
 def load_secrets():
     """st.secrets (cloud) into os.environ. A real env var / .env always wins."""
@@ -77,308 +74,212 @@ def get_bot():
     load_secrets()
     if str(HERE) not in sys.path:
         sys.path.insert(0, str(HERE))
-    bot = __import__(BOT_SCRIPT)
-
-    # the bot keeps its Dhan token + "already alerted" state in files; on a cloud host the
-    # checkout can be read-only and is wiped on redeploy, so keep them in the temp dir
-    TMP_DIR.mkdir(parents=True, exist_ok=True)
-    bot.TOKEN_FILE = TMP_DIR / "dhan_token.json"
-    bot.STATE_FILE = TMP_DIR / "alert_state.json"
-
-    original_log = bot.log
-
-    def log_to_ui(msg):
-        original_log(msg)
-        try:                                   # show the bot's own log lines in the UI
-            lines = st.session_state["activity"]
-            lines.append(f"{pd.Timestamp.now(tz=bot.IST):%d %b %H:%M:%S} | {msg}")
-            del lines[:-200]
-        except Exception:
-            pass
-
-    bot.log = log_to_ui
-    return bot
+    return __import__(BOT_SCRIPT)
 
 
-st.set_page_config(page_title="Supertrend option selling", page_icon="chart_with_upwards_trend",
-                   layout="wide")
-bot = get_bot()
-if "activity" not in st.session_state:
-    st.session_state["activity"] = []
+st.set_page_config(
+    page_title="F&O Supertrend intraday alerts",
+    page_icon="chart_with_upwards_trend",
+    layout="wide",
+)
+
+try:
+    bot = get_bot()
+except Exception as exc:
+    st.error(
+        "Could not load the scanner. Check that Dhan credentials and the Discord "
+        f"webhook are set (Settings > Secrets on the cloud, .env locally).\n\n`{exc}`"
+    )
+    st.stop()
 
 
 # =========================================================
-# STATE (session_state + a temp file, so reloads keep the dedupe / day stats)
+# HELPERS
 # =========================================================
 def missing_vars():
-    needed = {"DISCORD_WEBHOOK_URL": bot.WEBHOOK}
+    needed = {
+        "DHAN_CLIENT_ID": bot.DHAN_CLIENT_ID,
+        "DISCORD_WEBHOOK_SUPERTREND_FNO_STOCKS": bot.DISCORD_WEBHOOK,
+    }
     if not (os.getenv("DHAN_ACCESS_TOKEN") or "").strip():
         needed.update({
-            "DHAN_CLIENT_ID": bot.CLIENT_ID,
-            "DHAN_PIN": bot.PIN,
-            "DHAN_TOTP_SECRET": bot.TOTP_SECRET,
+            "DHAN_PIN": bot.DHAN_PIN,
+            "DHAN_TOTP_SECRET": bot.DHAN_TOTP_SECRET,
         })
     return [k for k, v in needed.items() if not v]
 
 
-def load_stats(now):
+def signals_frame(signals):
+    rows = []
+    for s in signals:
+        rows.append({
+            "Symbol": s["symbol"],
+            "Direction": s["direction"],
+            "Signal candle": s["time"].strftime("%d-%b %H:%M"),
+            "Close": round(float(s["close"]), 2),
+            "ADX": round(float(s["adx"]), 2),
+            "ADX min (15)": round(float(s["adx_min_15"]), 2),
+            "ADX max (15)": round(float(s["adx_max_15"]), 2),
+            "+DI": round(float(s["plus_di"]), 2),
+            "-DI": round(float(s["minus_di"]), 2),
+            "DMI sep": round(float(s["dmi_gap"]), 2),
+        })
+    if not rows:
+        return pd.DataFrame(columns=[
+            "Symbol", "Direction", "Signal candle", "Close", "ADX",
+            "ADX min (15)", "ADX max (15)", "+DI", "-DI", "DMI sep",
+        ])
+    return pd.DataFrame(rows)
+
+
+def run_scan(send_alerts, progress, status):
+    """Walk the whole F&O universe. Returns (signals, scanned, errors)."""
+    status.info("Downloading the Dhan instrument master...")
+    progress.progress(0.0, text="Downloading the Dhan instrument master...")
+
+    stocks = bot.get_fno_stocks()
+    total = len(stocks)
+    signals = []
+    errors = 0
+
+    for i, (_, row) in enumerate(stocks.iterrows()):
+        symbol = str(row["UNDERLYING_SYMBOL"])
+        security_id = str(row["UNDERLYING_SECURITY_ID"])
+
+        text = f"Scanning {i + 1}/{total}: {symbol}"
+        progress.progress((i + 1) / total, text=text)
+        status.update(label=text)
+
+        try:
+            df = bot.fetch_intraday_data(security_id)
+            if df is not None:
+                found = bot.analyze_stock(symbol, security_id, df)
+                if found:
+                    signals.extend(found)
+                    if send_alerts:
+                        for signal in found:
+                            bot.send_discord(signal)
+                            time.sleep(0.5)
+        except Exception:
+            errors += 1
+
+        time.sleep(bot.REQUEST_DELAY)
+
+    signals.sort(key=lambda x: x["time"], reverse=True)
+    return signals, total, errors
+
+
+def send_test_message():
+    message = (
+        "🧪 **Test message**\n"
+        "The F&O Supertrend scanner can reach Discord from this Streamlit app."
+    )
     try:
-        data = json.loads(STATS_FILE.read_text())
-    except Exception:
-        data = {}
-    if not isinstance(data, dict) or data.get("date") != now.strftime("%Y-%m-%d"):
-        return {"date": now.strftime("%Y-%m-%d"), "events": []}
-    data.setdefault("events", [])
-    return data
-
-
-def save_stats(stats):
-    seen, events = set(), []
-    for e in stats.get("events", []):
-        key = (e[0], e[1])
-        if key in seen:                        # a page reload can re-append the same flip
-            continue
-        seen.add(key)
-        events.append(list(e))
-    stats["events"] = events
-    try:
-        TMP_DIR.mkdir(parents=True, exist_ok=True)
-        STATS_FILE.write_text(json.dumps(stats))
-    except Exception:
-        pass
-
-
-def last_closed_candle(now, lookback_days=6):
-    """Most recent 10-minute candle close that has already closed (weekend/holiday safe)."""
-    closes = []
-    for back in range(lookback_days + 1):
-        day = now.normalize() - pd.Timedelta(days=back)
-        if day.weekday() < 5:
-            closes.extend(bot.session_closes(day))
-    ready = [c for c in closes if c + pd.Timedelta(seconds=bot.CHECK_DELAY_SEC) <= now]
-    return max(ready) if ready else None
-
-
-def analyse(close):
-    """One check: the bot's own process_close (indicators + Discord + dedupe), then the
-    same numbers once more for the chart and table."""
-    stats = load_stats(bot.now_ist())
-    bot.process_close(close, bot.load_state(), stats)
-    save_stats(stats)
-
-    now = bot.now_ist()
-    start = now.normalize() - pd.Timedelta(days=bot.LOOKBACK_DAYS)
-    data = {}
-    for name, (sid, step) in bot.INDEXES.items():
-        df1 = bot.fetch_1m(sid, start, now)
-        res = bot.add_indicators(bot.make_candles(df1, now))
-        if res.empty:
-            continue
-        day_open, prev_close = bot.day_refs(df1)
-        last = res.iloc[-1]
-        ref = (prev_close if bot.CHANGE_VS == "prev_close" else day_open).get(last.name.strftime("%Y-%m-%d"))
-        data[name] = {
-            "res": res,
-            "spot": float(last["close"]),
-            "change": (float(last["close"]) / ref - 1) * 100 if ref and pd.notna(ref) else None,
-            "bull": last["trend"] == 1,
-            "adx": None if pd.isna(last["adx"]) else float(last["adx"]),
-            "close_time": last["end"],
-            "ref": float(ref) if ref and pd.notna(ref) else None,
-        }
-    if not data:
-        raise RuntimeError("Dhan returned no candles - market closed or a holiday?")
-    return data
-
-
-def summary_args(stats):
-    ev = stats.get("events", [])
-    n_trade = sum(1 for e in ev if e[3] == "TRADE")
-    if ev:
-        lines = [f"Flips today: {len(ev)} (TRADE {n_trade}, NORMAL {len(ev) - n_trade})"]
-        lines += [f"{n} {t} {'BULLISH' if b else 'BEARISH'} - {k}" for n, t, b, k in ev]
-    else:
-        lines = ["No Supertrend flips today"]
-    return ("Market closed - day summary", "\n".join(lines))
-
-
-def run_check(close):
-    """Run one check, remember the result. Returns (ok, message)."""
-    try:
-        st.session_state["data"] = analyse(close)
-        st.session_state["last_close"] = close.isoformat()
-        st.session_state["errors"] = 0
-        st.session_state["last_error"] = None
-        return True, f"Checked the {close:%H:%M} candle"
+        res = requests.post(bot.DISCORD_WEBHOOK, json={"content": message}, timeout=15)
+        return res.status_code in (200, 204), res
     except Exception as exc:
-        bot.log(f"ERROR: {exc}")
-        st.session_state["errors"] = st.session_state.get("errors", 0) + 1
-        st.session_state["last_error"] = str(exc)
-        return False, str(exc)
+        return False, exc
 
 
 # =========================================================
-# SIDEBAR (re-rendered on click; the monitor view below is the part that auto-refreshes)
+# SIDEBAR
 # =========================================================
-st.title("Supertrend option-selling alerts")
+st.title("F&O Supertrend intraday alerts")
 st.caption(
-    f"Alert when Supertrend({bot.ST_PERIOD}, {bot.ST_MULT}) flips on a closed "
-    f"{bot.CANDLE_MIN}-minute candle - ADX({bot.ADX_PERIOD}) > {bot.ADX_MIN} = TRADE alert, "
-    f"below = NORMAL alert ({'on' if bot.SEND_NORMAL_ALERTS else 'off'})"
+    f"10-minute Supertrend({bot.ST_PERIOD}, {bot.ST_MULT}) flip + ADX({bot.ADX_PERIOD}) > "
+    f"{bot.ADX_MIN} + ADX slope (>= {bot.ADX_SLOPE_RISING_PCT:.0%} of last "
+    f"{bot.ADX_SLOPE_LOOKBACK} rising) + DMI separation >= {bot.DMI_SEPARATION_MIN:.0f}"
 )
 
 missing = missing_vars()
-with st.sidebar:
-    st.header("Monitor")
-    if missing:
-        st.error("Missing credentials:\n\n`" + "`\n`".join(missing) + "`\n\n"
-                 "Set them in .env (local) or Settings > Secrets (cloud).")
-    running = st.session_state.get("monitor_on", False)
-    c1, c2 = st.columns(2)
-    start = c1.button("Start", type="primary", **WIDE_BUTTON, disabled=bool(missing))
-    stop = c2.button("Stop", **WIDE_BUTTON, disabled=not running)
-    if start:
-        st.session_state["monitor_on"] = True
-        st.session_state["last_close"] = None
-        st.session_state["errors"] = 0
-    if stop:
-        st.session_state["monitor_on"] = False
-    if start or stop:
-        st.rerun()
+if "signals" not in st.session_state:
+    st.session_state["signals"] = None
 
-    if st.button("Run check once", **WIDE_BUTTON, disabled=bool(missing)):
-        one = last_closed_candle(bot.now_ist())
-        if one is None:
-            st.error("No 10-minute candle has closed yet")
-        else:
-            with st.spinner("Fetching candles from Dhan..."):
-                ok, msg = run_check(one)
-            st.success(msg) if ok else st.error(msg)
+with st.sidebar:
+    st.header("Scanner")
+
+    if missing:
+        st.error(
+            "Missing credentials:\n\n`" + "`\n`".join(missing) + "`\n\n"
+            "Set them in .env (local) or Settings > Secrets (cloud)."
+        )
+
+    disabled = bool(missing) or st.session_state.get("scanning", False)
+
+    scan_alert = st.button(
+        "Scan and alert", type="primary", **WIDE_BUTTON, disabled=disabled
+    )
+    scan_only = st.button("Scan only (no Discord)", **WIDE_BUTTON, disabled=disabled)
+
+    if st.button("Clear results", **WIDE_BUTTON):
+        st.session_state["signals"] = None
+        st.rerun()
 
     st.divider()
     st.header("Discord")
     if st.button("Send test message", **WIDE_BUTTON, disabled=bool(missing)):
-        sent = bot.safe_post("Test message",
-                             "Supertrend alert can reach Discord from this Streamlit app.", 0x5865F2)
-        st.toast("Test message sent" if sent else "Send failed - see log")
-    if st.button("Send day summary", **WIDE_BUTTON, disabled=bool(missing)):
-        sent = bot.safe_post(*summary_args(load_stats(bot.now_ist())), 0x5865F2)
-        st.toast("Summary sent" if sent else "Send failed - see log")
+        ok, info = send_test_message()
+        st.toast("Test message sent" if ok else f"Send failed: {info}")
 
     st.divider()
-    st.caption(f"Watching **{', '.join(bot.INDEXES)}** - strike step "
-               f"{', '.join(str(v[1]) for v in bot.INDEXES.values())} - "
-               f"strike offset {bot.STRIKE_OFFSET} - change vs {bot.CHANGE_VS}")
+    st.caption(
+        f"Result window: last {bot.RESULT_WINDOW_MIN} min - warm-up {bot.WARMUP_DAYS} days - "
+        f"universe: NSE F&O stocks (FUTSTK/OPTSTK)"
+    )
+    st.caption("A full scan walks every F&O stock (~1s each), so it can take a few minutes.")
 
 
 # =========================================================
-# MONITOR VIEW - one fragment, so the timer refreshes the clock, the results and the log
+# MAIN
 # =========================================================
-def draw_status(close, now):
-    h1, h2 = st.columns([3, 2])
-    if close is None:
-        h1.metric("Last closed candle", "n/a")
-    else:
-        left = (close + pd.Timedelta(seconds=bot.CHECK_DELAY_SEC) - now).total_seconds()
-        h1.metric("Last closed candle", f"{close:%H:%M} IST", None if left <= 0 else f"data in {left:,.0f}s")
+if scan_alert or scan_only:
+    st.session_state["scanning"] = True
+    progress = st.progress(0.0, text="Starting...")
+    status = st.status("Scanning the F&O universe...", expanded=True)
     try:
-        nxt, trig = bot.next_trigger(now)
-        h2.metric("Next candle close", f"{nxt:%d %b %H:%M}",
-                  f"in {(trig - now).total_seconds() / 60:,.1f} min")
-    except Exception:
-        h2.metric("Next candle close", "n/a")
+        signals, scanned, errors = run_scan(scan_alert, progress, status)
+        st.session_state["signals"] = signals
+        st.session_state["scanned"] = scanned
+        st.session_state["errors"] = errors
+        st.session_state["alerted"] = scan_alert
+        status.update(
+            label=f"Done - scanned {scanned} stocks, {len(signals)} signal(s), "
+                  f"{errors} error(s)",
+            state="complete",
+            expanded=False,
+        )
+    except Exception as exc:
+        status.update(label=f"Scan failed: {exc}", state="error")
+    finally:
+        progress.empty()
+        st.session_state["scanning"] = False
 
+signals = st.session_state.get("signals")
+if signals is not None:
+    scanned = st.session_state.get("scanned", 0)
+    errors = st.session_state.get("errors", 0)
 
-def draw_results(data):
-    for name, d in data.items():
-        st.subheader(name)
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Spot", f"{d['spot']:,.2f}", None if d["change"] is None else f"{d['change']:+.2f}%")
-        m2.metric("Signal", "BULLISH - sell PUT" if d["bull"] else "BEARISH - sell CALL")
-        m3.metric(f"ADX({bot.ADX_PERIOD})", "n/a" if d["adx"] is None else f"{d['adx']:.1f}")
-        m4.metric("Candle closed", f"{d['close_time']:%d %b %H:%M}")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Stocks scanned", f"{scanned}")
+    c2.metric("Signals found", f"{len(signals)}")
+    c3.metric("Fetch errors", f"{errors}")
 
-        res = d["res"].tail(90)
-        fig = make_subplots(specs=[[{"secondary_y": True}]])
-        fig.add_trace(go.Scatter(x=res.index, y=res["close"], name="Close",
-                                 mode="lines", line=dict(color="#4c8bf5")), secondary_y=False)
-        fig.add_trace(go.Scatter(x=res.index, y=res["supertrend"], name="Supertrend",
-                                 mode="lines", line=dict(color="#f5a04c")), secondary_y=False)
-        flipped = res[res["flip"].fillna(False).astype(bool)]
-        for value, colour, label in ((1, "#2ecc71", "Flip BULLISH"), (-1, "#e74c3c", "Flip BEARISH")):
-            f = flipped[flipped["trend"] == value]
-            if not f.empty:
-                fig.add_trace(go.Scatter(
-                    x=f.index, y=f["close"], name=label, mode="markers",
-                    marker=dict(color=colour, size=11,
-                                symbol="triangle-up" if value == 1 else "triangle-down"),
-                    hovertemplate="%{x|%H:%M} " + label + "<extra></extra>"), secondary_y=False)
-        fig.add_trace(go.Scatter(x=res.index, y=res["adx"], name=f"ADX({bot.ADX_PERIOD})",
-                                 mode="lines", line=dict(color="#9b59b6", width=1)), secondary_y=True)
-        fig.add_hline(y=bot.ADX_MIN, line_dash="dash", line_color="#9b59b6",
-                      annotation_text=f"ADX {bot.ADX_MIN}", secondary_y=True)
-        fig.update_layout(height=430, margin=dict(l=10, r=10, t=30, b=10),
-                          hovermode="x unified", legend=dict(orientation="h", y=1.12))
-        fig.update_yaxes(title_text="Index", secondary_y=False)
-        fig.update_yaxes(title_text="ADX", range=[0, max(60.0, float(res["adx"].max() or 0) * 1.2)],
-                         secondary_y=True)
-        st.plotly_chart(fig, **WIDE_CHART)
-
-        table = res.tail(20).copy()
-        table["dir"] = ["up" if t == 1 else "down" for t in table["trend"]]
-        table["flip"] = table["flip"].map({True: "FLIP", False: ""})
-        table = table[["dir", "open", "high", "low", "close", "supertrend", "adx", "flip", "end"]]
-        table.columns = ["Dir", "Open", "High", "Low", "Close", "Supertrend", "ADX", "Flip", "Candle end"]
-        st.dataframe(table.round(2), height=300, **WIDE_FRAME)
-
-        _, lines = bot.build_alert(name, res.iloc[-1], bot.INDEXES[name][1], d["ref"])
-        kind = "TRADE ALERT" if d["adx"] and d["adx"] > bot.ADX_MIN else "NORMAL ALERT"
-        with st.expander(f"Discord message for the {d['close_time']:%H:%M} candle"):
-            st.markdown(f"**{kind}**")
-            st.markdown("\n".join("- " + line for line in lines))
-
-
-def draw_day_stats(now):
-    stats = load_stats(now)
-    if stats["events"]:
-        st.subheader(f"Flips today ({len(stats['events'])})")
-        st.dataframe(pd.DataFrame([{"Index": n, "Time": t, "Direction": "BULLISH" if b else "BEARISH",
-                                    "Type": k} for n, t, b, k in stats["events"]]),
-                     hide_index=True, **WIDE_FRAME)
-    activity = st.session_state["activity"]
-    if activity:
-        with st.expander("Log", expanded=bool(st.session_state.get("last_error"))):
-            st.code("\n".join(activity[-40:]), language=None)
-
-
-@st.fragment(run_every=20)
-def monitor_view():
-    now = bot.now_ist()
-    close = last_closed_candle(now)
-    draw_status(close, now)
-
-    if not st.session_state.get("monitor_on", False):
-        st.info("Monitor stopped. Press **Start** in the sidebar to check every candle close - "
-                "it keeps going as long as this browser tab is open.")
-    elif close is None:
-        st.warning("No 10-minute candle has closed yet today.")
-    elif st.session_state.get("last_close") == close.isoformat():
-        st.caption(f"{close:%H:%M} candle already checked - waiting for the next one.")
+    if signals:
+        if st.session_state.get("alerted"):
+            st.success(f"Discord alerts sent for {len(signals)} signal(s).")
+        frame = signals_frame(signals)
+        st.dataframe(frame, hide_index=True, **WIDE_FRAME)
+        st.download_button(
+            "Download CSV",
+            frame.to_csv(index=False).encode("utf-8"),
+            file_name=f"fno_supertrend_signals_{pd.Timestamp.now():%Y%m%d_%H%M}.csv",
+            mime="text/csv",
+            **WIDE_DOWNLOAD,
+        )
     else:
-        with st.spinner(f"Checking the {close:%H:%M} candle..."):
-            run_check(close)
-        if st.session_state.get("last_error"):
-            st.warning(f"Check failed: {st.session_state['last_error']}")
-        if st.session_state.get("errors", 0) >= 3:
-            st.error(f"{st.session_state['errors']} failed checks in a row - "
-                     f"last: {st.session_state.get('last_error')}")
-
-    data = st.session_state.get("data")
-    if data:
-        draw_results(data)
-    elif not missing:
-        st.info("No check has run yet - press **Run check once** or **Start** in the sidebar.")
-    draw_day_stats(now)
-
-
-monitor_view()
+        st.info(
+            f"No qualifying signal in the last {bot.RESULT_WINDOW_MIN} minutes. "
+            "A signal needs a Supertrend flip plus every ADX/DMI filter to line up."
+        )
+else:
+    st.info("Press **Scan and alert** in the sidebar to look for signals.")
